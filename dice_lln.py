@@ -1,6 +1,33 @@
+# dice_lln.py
+# Headless-safe Streamlit app for LLN dice simulation.
+import os
+import sys
+import traceback
+
+# --- Try to set a non-interactive matplotlib backend BEFORE importing pyplot ---
+try:
+    import matplotlib
+    matplotlib.use("Agg")   # Safe for headless/container environments
+    import matplotlib.pyplot as plt
+    mpl_available = True
+except Exception:
+    mpl_available = False
+    # Print full traceback to server logs so you can inspect the cause.
+    traceback.print_exc()
+    plt = None
+
 import streamlit as st
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
+
+# If Matplotlib isn't available, we will use Altair as a fallback (Altair is in requirements.txt).
+if not mpl_available:
+    try:
+        import altair as alt
+        alt_available = True
+    except Exception:
+        alt_available = False
+        traceback.print_exc()
 
 st.set_page_config(page_title="Law of Large Numbers: Dice Simulation", layout="centered")
 
@@ -80,53 +107,83 @@ def simulate_run(n, sides, is_success_func, rng):
     Vectorized for efficiency.
     """
     rolls = rng.integers(1, sides + 1, size=n)
-    # Vectorize success check (efficient and clear)
     successes = np.array([is_success_func(x) for x in rolls], dtype=float)
     running_p = np.cumsum(successes) / np.arange(1, n + 1)
     return running_p, rolls
 
-# Build plot
-fig, ax = plt.subplots(figsize=(9, 4), dpi=150)
+# Run simulations
 x = np.arange(1, n_rolls + 1)
-
-# Store final estimates for stats panel
 all_estimates = []
+runs_data = []  # for altair fallback
 
 for run in range(n_runs):
-    # Simulate ONE consistent run
-    running_p, _ = simulate_run(n_rolls, sides, is_success, rng)
+    running_p, rolls = simulate_run(n_rolls, sides, is_success, rng)
     all_estimates.append(running_p[-1])
-    
-    # Plot the full trajectory
-    alpha = 1.0 if n_runs == 1 else (0.9 if run == 0 else 0.55)
-    ax.plot(x, running_p, linewidth=1.5, alpha=alpha, label=f"Run {run+1}" if n_runs <= 3 else None)
-    
-    # If requested, overlay markers on the SAME run's first 30 points
+    runs_data.append(pd.DataFrame({
+        "roll": x,
+        "running_p": running_p,
+        "run": f"Run {run+1}"
+    }))
+
+# Plotting: prefer matplotlib (faster control), fallback to Altair if matplotlib import failed
+if mpl_available and plt is not None:
+    fig, ax = plt.subplots(figsize=(9, 4), dpi=150)
+
+    for run_idx, df in enumerate(runs_data):
+        running_p = df["running_p"].to_numpy()
+        alpha = 1.0 if n_runs == 1 else (0.9 if run_idx == 0 else 0.55)
+        label = f"Run {run_idx+1}" if n_runs <= 3 else None
+        ax.plot(x, running_p, linewidth=1.5, alpha=alpha, label=label)
+
+        if show_points:
+            k = min(30, n_rolls)
+            ax.plot(x[:k], running_p[:k], marker="o", linestyle="None", markersize=4,
+                    color=f'C{run_idx % 10}')
+
+    # Highlight n=1 point explicitly
+    if len(runs_data) > 0:
+        ax.plot(1, runs_data[-1]["running_p"].iloc[0], marker="s", markersize=8, color="red", label="n=1", zorder=5)
+
+    ax.axhline(theoretical_p, color='black', linestyle="--", linewidth=2, label="Theoretical p")
+    ax.text(x[-1] * 0.95, theoretical_p, "  theoretical p", va="center", ha="right", fontsize=9, color='black')
+
+    ax.set_xlim(1, n_rolls)
+    y_max = max(1.0, theoretical_p * 2) if theoretical_p > 0 else 1.0
+    ax.set_ylim(0, min(1.0, y_max))
+    ax.set_xlabel("Number of rolls (n)")
+    ax.set_ylabel(r"Running estimate $\hat{p}_n$")
+    ax.set_title("Convergence of Empirical Probability (Law of Large Numbers)", fontsize=10)
+    ax.grid(True, alpha=0.3)
+    if n_runs > 1 or show_points:
+        ax.legend(loc='upper right', fontsize=8)
+
+    st.pyplot(fig, clear_figure=True)
+
+elif 'alt_available' in globals() and alt_available:
+    # Build a combined DataFrame for Altair
+    big_df = pd.concat(runs_data, ignore_index=True)
+    # Altair line chart with optional points
+    base = alt.Chart(big_df).mark_line().encode(
+        x=alt.X("roll:Q", title="Number of rolls (n)"),
+        y=alt.Y("running_p:Q", title=r"Running estimate $\hat{p}_n$"),
+        color="run:N",
+        tooltip=["run", "roll", alt.Tooltip("running_p:Q", format=".4f")]
+    )
+
+    chart = base
     if show_points:
-        k = min(30, n_rolls)
-        ax.plot(x[:k], running_p[:k], marker="o", linestyle="None", markersize=4, color='C0' if n_runs == 1 else f'C{run}')
+        points = alt.Chart(big_df[big_df["roll"] <= 30]).mark_circle(size=30).encode(
+            x="roll:Q", y="running_p:Q", color="run:N"
+        )
+        chart = base + points
 
-# Highlight n=1 point explicitly (critical for LLN intuition)
-ax.plot(1, running_p[0], marker="s", markersize=8, color="red", label="n=1", zorder=5)
+    # Add theoretical p as a rule
+    rule = alt.Chart(pd.DataFrame({"y": [theoretical_p]})).mark_rule(strokeDash=[5,5]).encode(y="y:Q")
+    st.altair_chart((chart + rule).interactive(), use_container_width=True)
 
-# Theoretical probability line
-ax.axhline(theoretical_p, color='black', linestyle="--", linewidth=2, label="Theoretical p")
-ax.text(x[-1] * 0.95, theoretical_p, "  theoretical p", va="center", ha="right", fontsize=9, color='black')
-
-# Styling
-ax.set_xlim(1, n_rolls)
-y_max = max(1.0, theoretical_p * 2) if theoretical_p > 0 else 1.0
-ax.set_ylim(0, min(1.0, y_max))
-ax.set_xlabel("Number of rolls (n)")
-ax.set_ylabel(r"Running estimate $\hat{p}_n$")
-ax.set_title("Convergence of Empirical Probability (Law of Large Numbers)", fontsize=10)
-ax.grid(True, alpha=0.3)
-
-# Add legend only if multiple runs or n=1 marker
-if n_runs > 1 or show_points:
-    ax.legend(loc='upper right', fontsize=8)
-
-st.pyplot(fig, clear_figure=True)
+else:
+    st.error("Unable to render plots: neither matplotlib nor Altair is available. Check server logs.")
+    st.stop()
 
 # Stats panel
 st.markdown("### Latest Stats")
